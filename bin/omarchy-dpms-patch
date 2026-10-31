@@ -1,0 +1,88 @@
+#!/bin/bash
+# On lock, blank the internal panel with DPMS (as v1) and dim external monitors
+# (brightness and contrast to 0) via DDC/CI instead of DPMS, so they keep their HDMI link (the MSI G271 drops
+# hotplug in standby, which makes Hyprland unplug/replug it while locked).
+# Brightness and contrast are saved per monitor and restored on wake/unlock.
+# Idempotent. Applied by install.sh and re-applied by the pacman hook after omarchy upgrades.
+
+set -euo pipefail
+
+f="${TARGET:-/usr/share/omarchy/bin/omarchy-brightness-display}"
+if [[ -z ${TARGET:-} && $EUID -ne 0 ]]; then exec sudo "$0" "$@"; fi
+
+if grep -q 'ddc-dim-external' "$f"; then echo "already patched"; exit 0; fi
+# Not patched: the file is pristine (first run, or replaced by an Omarchy update),
+# so refresh the backup from it and patch from that.
+# (A leftover v1 patch has no pristine copy of its own: keep the existing .orig then.)
+if ! grep -q 'internal-only-dpms' "$f" || [[ ! -e $f.orig ]]; then cp "$f" "$f.orig"; fi
+src="$f.orig"
+
+python3 - "$src" "$f" <<'EOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+
+old_off = '''if [[ $step == "off" ]]; then
+  hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1
+  exit 0
+elif [[ $step == "on" ]]; then
+'''
+assert old_off in s, "expected block not found; Omarchy script changed"
+
+new_off = r'''# ddc-dim-external: external monitors that drop HPD in standby cause unplug/replug
+# loops while locked, so blank the built-in panel with DPMS and dim externals via DDC.
+ddc_state_dir="${XDG_RUNTIME_DIR:-/tmp}/omarchy-lock-ddc"
+
+ddc_bus() {
+  ddcutil --skip-ddc-checks detect --brief 2>/dev/null | awk -v monitor="$1" '
+    /I2C bus:/ { bus = $NF; sub(/^.*\/i2c-/, "", bus) }
+    /DRM connector:/ {
+      connector = $NF; sub(/^card[0-9]+-/, "", connector)
+      if (connector == monitor && bus != "") { print bus; exit }
+      bus = ""
+    }'
+}
+
+ddc_get() { ddcutil --bus "$1" --brief getvcp "$2" 2>/dev/null | awk -v c="$2" '$1=="VCP" && $2==c {print $4}'; }
+
+ddc_dim() {
+  local m="$1" bus bri con
+  bus=$(ddc_bus "$m") || return 0
+  [[ -n $bus ]] || return 0
+  mkdir -p "$ddc_state_dir"
+  # Keep the first saved values so a repeated "off" never saves the dimmed 0s.
+  if [[ ! -s $ddc_state_dir/$m ]]; then
+    bri=$(ddc_get "$bus" 10); con=$(ddc_get "$bus" 12)
+    [[ $bri =~ ^[0-9]+$ && $con =~ ^[0-9]+$ ]] || return 0
+    printf '%s %s %s\n' "$bus" "$bri" "$con" >"$ddc_state_dir/$m"
+  fi
+  # Brightness 0 leaves a faint backlight glow; contrast 0 blacks out the picture.
+  ddcutil --bus "$bus" setvcp 10 0 >/dev/null 2>&1 || true
+  ddcutil --bus "$bus" setvcp 12 0 >/dev/null 2>&1 || true
+}
+
+ddc_restore() {
+  [[ -d $ddc_state_dir ]] || return 0
+  local f bus bri con
+  for f in "$ddc_state_dir"/*; do
+    [[ -s $f ]] || continue
+    read -r bus bri con <"$f" || continue
+    if ddcutil --bus "$bus" setvcp 12 "$con" >/dev/null 2>&1 && ddcutil --bus "$bus" setvcp 10 "$bri" >/dev/null 2>&1; then rm -f "$f"; fi
+  done
+}
+
+if [[ $step == "off" ]]; then
+  for m in $(hyprctl monitors -j 2>/dev/null | jq -r '.[].name'); do
+    if [[ $m =~ ^(eDP|LVDS|DSI)- ]]; then
+      hyprctl dispatch "hl.dsp.dpms({ action = \"disable\", monitor = \"$m\" })" >/dev/null 2>&1
+    else
+      ddc_dim "$m"
+    fi
+  done
+  exit 0
+elif [[ $step == "on" ]]; then
+  ddc_restore
+'''
+open(dst, "w").write(s.replace(old_off, new_off, 1))
+EOF
+bash -n "$f" && echo "patched OK v2 (backup: $f.orig)"

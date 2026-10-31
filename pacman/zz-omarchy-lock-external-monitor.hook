@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = omarchy
+
+[Action]
+Description = Re-applying external-monitor lock blanking patch (omarchy-brightness-display)...
+When = PostTransaction
+Exec = /bin/sh -c '/usr/local/bin/omarchy-dpms-patch || echo "omarchy-dpms-patch FAILED: upstream script changed, patch not applied (lock may blank HDMI)"'
